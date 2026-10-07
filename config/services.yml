@@ -10,5 +10,6 @@ services:
             - '@dbal.conn'
             - '@text_formatter.utils'
             - '@language'
+            - '@auth'
         tags:
             - { name: event.listener }

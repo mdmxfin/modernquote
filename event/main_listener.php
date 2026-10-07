@@ -28,6 +28,7 @@ class main_listener implements EventSubscriberInterface
     protected $db;
     protected $bbcode_utils;
     protected $lang;
+    protected $auth;
     protected $fqcookie_suffix = '_fqcookie';
     protected $fqcookie_full = '';
     protected $mqcookie = 'mqcookie';
@@ -51,7 +52,8 @@ class main_listener implements EventSubscriberInterface
         \phpbb\content_visibility $phpbb_content_visibility, 
         \phpbb\db\driver\driver_interface $db, 
         \phpbb\textformatter\s9e\utils $bbcode_utils, 
-        \phpbb\language\language $lang)
+        \phpbb\language\language $lang,
+        \phpbb\auth\auth $auth)
     {
         $this->request = $request;
         $this->config = $config;
@@ -61,7 +63,8 @@ class main_listener implements EventSubscriberInterface
         $this->db = $db;
         $this->bbcode_utils = $bbcode_utils;
         $this->lang = $lang;
-        
+        $this->auth = $auth;
+
         $this->fqcookie_full = $this->config['cookie_name'] . $this->fqcookie_suffix;
     }
     
@@ -127,19 +130,56 @@ class main_listener implements EventSubscriberInterface
             if (isset($posts))
             {
                 $output = '';
-                foreach ($posts as $post_id)
+                $post_ids = array_filter(array_map('intval', $posts), function ($pid) {
+                    return $pid > 0;
+                });
+
+                // Fetch all quoted posts at once. Each post is checked against its own forum, so only
+                // posts the user could read in viewtopic are quoted: f_read, forum password, and
+                // topic/post visibility. Posts that fail are left out.
+                $rowset = array();
+                if (!empty($post_ids))
                 {
-                    $pid = (int) $post_id;
-                    $sql = 'SELECT p.*, u.username
-                    FROM ' . POSTS_TABLE . ' p, ' . USERS_TABLE . " u
-                    WHERE p.post_id = $pid
-                        AND u.user_id = p.poster_id
-                        AND " . $this->phpbb_content_visibility->get_visibility_sql('post', $event['forum_id'], 'p.');
-                    
+                    $sql = $this->db->sql_build_query('SELECT', array(
+                        'SELECT'    => 'p.*, u.username, t.topic_visibility, t.topic_poster, f.forum_password, fa.user_id AS forum_access_user_id',
+                        'FROM'      => array(
+                            POSTS_TABLE  => 'p',
+                            TOPICS_TABLE => 't',
+                            USERS_TABLE  => 'u',
+                            FORUMS_TABLE => 'f',
+                        ),
+                        'LEFT_JOIN' => array(
+                            array(
+                                'FROM' => array(FORUMS_ACCESS_TABLE => 'fa'),
+                                'ON'   => "fa.forum_id = f.forum_id AND fa.session_id = '" . $this->db->sql_escape($this->user->session_id) . "'",
+                            ),
+                        ),
+                        'WHERE'     => $this->db->sql_in_set('p.post_id', array_unique($post_ids)) . '
+                            AND t.topic_id = p.topic_id
+                            AND u.user_id = p.poster_id
+                            AND f.forum_id = p.forum_id',
+                    ));
                     $result = $this->db->sql_query($sql);
-                    $post_data = $this->db->sql_fetchrow($result);
+                    while ($row = $this->db->sql_fetchrow($result))
+                    {
+                        $forum_id = (int) $row['forum_id'];
+                        if ($this->auth->acl_get('f_read', $forum_id)
+                            && (!$row['forum_password'] || $row['forum_access_user_id'] == $this->user->data['user_id'])
+                            && $this->phpbb_content_visibility->is_visible('topic', $forum_id, $row)
+                            && $this->phpbb_content_visibility->is_visible('post', $forum_id, $row))
+                        {
+                            $rowset[(int) $row['post_id']] = $row;
+                        }
+                    }
                     $this->db->sql_freeresult($result);
-                    $output .= $this->get_decoded_quote($post_data);
+                }
+
+                foreach ($post_ids as $pid)
+                {
+                    if (isset($rowset[$pid]))
+                    {
+                        $output .= $this->get_decoded_quote($rowset[$pid]);
+                    }
                 }
             }
             
